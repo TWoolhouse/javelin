@@ -80,7 +80,7 @@ impl RenderCtrl {
             RenderWaveformGraph::Semitone => {
                 let freq_start = 20.0f32;
                 let freq_end = output.len() as f32;
-                let freq_step = (1.0 / 12.0f32).exp2() as f32;
+                let freq_step = (1.0 / 12.0f32).exp2();
                 let mut buckets: Vec<f32> = Vec::with_capacity((freq_end / freq_step) as usize);
 
                 let mut freq_lb = freq_start;
@@ -150,7 +150,7 @@ impl App {
 }
 
 fn slice_max(data: &[f32]) -> f32 {
-    data.iter().cloned().reduce(f32::max).unwrap()
+    data.iter().copied().reduce(f32::max).unwrap()
 }
 
 const fn optimal_fft_size_atleast(minimum: usize) -> usize {
@@ -195,13 +195,13 @@ fn paint_waveform(ui: &mut egui::Ui, space: egui::Rect, data: &[f32]) {
     };
 
     for (i, dp) in data.iter().enumerate() {
-        let (x, y_lb, y_ub) = remap(i as f32, *dp).into();
+        let (x, y_lb, y_ub) = remap(i as f32, *dp);
         painter.vline(x, egui::Rangef::new(y_lb, y_ub), stroke);
     }
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // TODO: This is way too much locking
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -231,7 +231,7 @@ impl eframe::App for App {
                     ctrl.input.len() as f32 / self.output.cfg.sample_rate.0 as f32
                 ));
 
-                let cpu_usage = _frame.info().cpu_usage;
+                let cpu_usage = frame.info().cpu_usage;
                 ui.label(if let Some(usage) = cpu_usage {
                     format!("UI Time: {:.2} ms", usage * 1000.0)
                 } else {
@@ -263,7 +263,7 @@ impl eframe::App for App {
                     let mut file = std::fs::File::create("waveform.csv").unwrap();
                     writeln!(file, "Magnitude").unwrap();
                     for point in &self.render.waveform {
-                        writeln!(file, "{}", point).unwrap();
+                        writeln!(file, "{point}").unwrap();
                     }
                 }
 
@@ -338,7 +338,7 @@ impl eframe::App for App {
                         let input = {
                             let ctrl = self.output.ctrl.lock();
                             ctrl.trigger.store(0, std::sync::atomic::Ordering::Release);
-                            ctrl.output.iter().cloned().collect::<Vec<_>>()
+                            ctrl.output.iter().copied().collect::<Vec<_>>()
                         };
                         self.render.compute_waveform(&input);
                     }
@@ -410,7 +410,7 @@ fn audio_stream_input(ctrl: &mut AudioCtrl, config: &cpal::StreamConfig, data: &
     }
 }
 
-fn spawn_stream_output(notify: impl Fn() -> () + std::marker::Send + 'static) -> AudioOutput {
+fn spawn_stream_output(notify: impl Fn() + std::marker::Send + 'static) -> AudioOutput {
     let host = cpal::default_host();
     let device = host.default_output_device().unwrap();
     let config = device.default_output_config().unwrap();
@@ -428,7 +428,7 @@ fn spawn_stream_output(notify: impl Fn() -> () + std::marker::Send + 'static) ->
                     notify();
                 }
             },
-            move |err| eprintln!("an error occurred on stream: {}", err),
+            move |err| eprintln!("an error occurred on stream: {err}"),
             None,
         )
         .unwrap();
@@ -455,7 +455,7 @@ fn spawn_stream_input(ctrl: &Arc<Mutex<AudioCtrl>>) -> cpal::Stream {
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 audio_stream_input(&mut ctrl.lock(), &config, data);
             },
-            move |err| eprintln!("an error occurred on stream: {}", err),
+            move |err| eprintln!("an error occurred on stream: {err}"),
             None,
         )
         .unwrap();
