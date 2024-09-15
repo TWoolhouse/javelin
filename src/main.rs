@@ -1,474 +1,480 @@
-use circular_buffer::CircularBuffer;
-use cpal::traits::*;
-use cpal::Sample;
-use derive_more::derive::{Deref, DerefMut};
-use hound;
-use ringbuf::storage::Heap;
-use ringbuf::{traits::*, LocalRb, StaticRb};
+use std::{
+    collections::VecDeque,
+    sync::{atomic::AtomicUsize, Arc},
+};
+
+use cpal::{traits::*, Sample};
+use egui::{mutex::Mutex, ViewportBuilder};
+use ringbuf::{
+    traits::{Consumer, Observer, RingBuffer},
+    LocalRb,
+};
 use rustfft::num_complex::Complex;
-use rustfft::num_traits::Pow;
-use std::f32::consts::PI;
-use std::num::NonZeroU32;
-use std::ops::DerefMut;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard};
-use tiny_skia::{Color, Pixmap, Transform};
-use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
-use winit::event_loop::EventLoop;
-use winit::keyboard::{Key, NamedKey};
-use winit::raw_window_handle::{DisplayHandle, HasDisplayHandle, HasWindowHandle, WindowHandle};
-use winit::window::Window;
 
-const FFT_SIZE: usize = nearest23(8192) as usize;
-const AMP: f32 = 0.1;
-
-const fn nearest23(target: i64) -> i64 {
-    let mut num = 1;
-    while num < target {
-        num <<= 1;
-    }
-
-    let mut best = num;
-    loop {
-        if (num - target).abs() < (best - target).abs() {
-            best = num;
-        }
-
-        if num < target {
-            num *= 3;
-        } else if num % 2 == 0 {
-            num /= 2;
-        } else {
-            return best;
-        }
-    }
+struct AudioCtrl {
+    playing: bool,
+    input: VecDeque<f32>,
+    output: LocalRb<ringbuf::storage::Heap<f32>>,
+    mic: Option<LocalRb<ringbuf::storage::Heap<f32>>>,
+    trigger: AtomicUsize,
 }
 
-fn fft(samples: &[f32], draw: &mut DrawCtx) -> Vec<Complex<f32>> {
-    let size = samples.len();
-    // let fft_fwd = draw.fft_planner.plan_fft_forward(size);
-    let fft_fwd = draw.fft_planner.plan_fft_forward(size);
-    let mut fft_buf_samples: Vec<Complex<f32>> =
-        samples.into_iter().map(|x| Complex::new(*x, 0.0)).collect();
-    let mut scratch = vec![Complex::new(0.0, 0.0); size];
-    fft_fwd.process_with_scratch(&mut fft_buf_samples, &mut scratch);
-    fft_buf_samples.truncate(size / 2 + 1);
-    fft_buf_samples
-}
-struct RenderTarget {
-    // SAFETY: surface must be dropped before window
-    surface: softbuffer::Surface<DisplayHandle<'static>, WindowHandle<'static>>,
-    window: Pin<Box<Window>>,
-    pixmap: Pixmap,
-}
-
-impl RenderTarget {
-    fn new(window: Window, context: &softbuffer::Context<DisplayHandle<'static>>) -> Self {
-        let window = Box::pin(window);
-        let mut surface = softbuffer::Surface::new(context, unsafe {
-            std::mem::transmute(window.as_ref().window_handle().unwrap())
-        })
-        .unwrap();
-        let size = window.inner_size();
-        surface
-            .resize(
-                NonZeroU32::new(size.width).unwrap(),
-                NonZeroU32::new(size.height).unwrap(),
-            )
-            .unwrap();
-        RenderTarget {
-            window,
-            surface,
-            pixmap: Pixmap::new(size.width, size.height).unwrap(),
-        }
-    }
-}
-
-fn pixmap_write_to_buffer(
-    pixmap: &Pixmap,
-    buffer: &mut softbuffer::Buffer<'_, DisplayHandle<'static>, WindowHandle<'static>>,
-) {
-    let buf_dst = buffer.as_mut();
-    let buf_src = pixmap.data();
-
-    buf_dst
-        .iter_mut()
-        .zip(buf_src.chunks_exact(4).map(|pixel| {
-            // RGBA -> 0RGB
-            (pixel[0] as u32) << 16 | (pixel[1] as u32) << 8 | (pixel[2] as u32) << 0
-        }))
-        .for_each(|(dst, src)| {
-            *dst = src;
-        });
-}
-
-fn draw_line_graph(pixmap: &mut Pixmap, data: &[f32], y_max: f32) {
-    let width = pixmap.width() as usize;
-    let height = pixmap.height() as usize;
-
-    let x_sf = width as f32 / data.len() as f32;
-    let y_sf = height as f32 / y_max;
-
-    let mut pb = tiny_skia::PathBuilder::new();
-    // pb.move_to(0.0, 0.0);
-
-    for (x, dp) in data.iter().enumerate() {
-        let y = (dp * y_sf) as usize;
-        let x = x as f32 * x_sf;
-        pb.move_to(x, 0.0);
-        pb.line_to(x, y as f32);
-    }
-    // pb.line_to(width as f32, 0.0);
-
-    let mut paint = tiny_skia::Paint::default();
-    paint.set_color_rgba8(10, 67, 227, 255);
-    paint.anti_alias = true;
-
-    let path = pb.finish().unwrap();
-    let mut stroke = tiny_skia::Stroke::default();
-    stroke.width = 5.0;
-    stroke.line_cap = tiny_skia::LineCap::Round;
-
-    pixmap.stroke_path(
-        &path,
-        &paint,
-        &stroke,
-        Transform::identity()
-            .post_scale(1.0, -1.0)
-            .post_translate(0.0, height as f32),
-        None,
-    );
-}
-
-fn frequency_to_note(frequency: f32) -> f32 {
-    if frequency < 8.2 {
-        return 0.0;
-    }
-    12.0 * (frequency / 440.0).log2() + 69.0
-}
-
-fn hann_window(samples: &mut [f32]) {
-    let size = samples.len();
-    for (i, s) in samples.iter_mut().enumerate() {
-        let w = 0.5 - 0.5 * (2.0 * PI * i as f32 / size as f32).cos();
-        *s *= w;
-    }
-}
-
-fn freq_mags(fft: &[Complex<f32>]) -> Vec<f32> {
-    fft.iter()
-        .map(|c| {
-            let im = c.im.abs();
-            let re = c.re.abs();
-            im.max(re)
-        })
-        .collect()
-}
-
-fn bucket_note(freq_mags: &[f32]) -> Vec<f32> {
-    let mut notes = vec![0.0f32; frequency_to_note(freq_mags.len() as f32) as usize + 1];
-    for (i, mag) in freq_mags.iter().enumerate() {
-        let note = frequency_to_note(i as f32);
-        notes[note as usize] += mag;
-    }
-    notes.remove(0);
-    notes
-}
-
-fn bucket_tsoding(freq_mags: &[f32]) -> Vec<f32> {
-    let mult = 1.06f32;
-    let freq_start = 20.0f32;
-    let freq_end = freq_mags.len() as f32;
-    let mut freq_lb = freq_start;
-    let mut out: Vec<f32> = Vec::with_capacity(100);
-
-    loop {
-        let freq_ub = freq_lb * mult;
-        let mut amp: f32 = freq_mags[(freq_lb as usize)..(freq_ub as usize).min(freq_end as usize)]
-            .iter()
-            .sum();
-        amp /= (freq_ub - freq_lb) + 1.0;
-        out.push(amp);
-
-        freq_lb = freq_ub;
-        if freq_lb > freq_end {
-            break;
-        }
-    }
-    out
-}
-
-fn bucket_e(freq_mags: &[f32]) -> Vec<f32> {
-    freq_mags.iter().map(|m| m.exp() - 1.0).collect()
-}
-
-fn main_draw(pixmap: &mut Pixmap, draw: &mut DrawCtx) {
-    let mut samples = {
-        let samples = draw.samples.lock().unwrap();
-        let size = samples.occupied_len();
-        if size < FFT_SIZE {
-            return;
-        }
-        samples.iter().cloned().collect::<Vec<f32>>()
-    };
-    hann_window(&mut samples);
-    let fft_res = fft(&samples, draw);
-    let freq_mags = freq_mags(&fft_res);
-
-    let mut output = bucket_tsoding(&freq_mags);
-
-    let mag_max = {
-        static mut MAG_MAX_HISTORY: CircularBuffer<100, f32> = CircularBuffer::new();
-        let mag_max = output
-            .iter()
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
-            .unwrap()
-            .to_owned();
-        unsafe {
-            MAG_MAX_HISTORY.push_back(mag_max);
-            MAG_MAX_HISTORY
-                .iter()
-                .max_by(|a, b| a.partial_cmp(b).unwrap())
-                .unwrap()
-                .to_owned()
-                .max(0.5)
-        }
-    };
-
-    let mag_max = if false {
-        output.iter_mut().for_each(|m| {
-            *m = 1.0f32 - (1.0 - (*m / mag_max)).pow(8);
-        });
-        1.0
-    } else {
-        mag_max
-    };
-
-    pixmap.fill(Color::BLACK);
-    draw_line_graph(pixmap, &output, mag_max);
-}
-
-struct DrawCtx {
-    samples: Arc<Mutex<LocalRb<Heap<f32>>>>,
-    playing: Arc<Mutex<bool>>,
-    fft_planner: rustfft::FftPlanner<f32>,
-}
-
-impl DrawCtx {
+impl AudioCtrl {
     fn new() -> Self {
-        DrawCtx {
-            samples: Arc::new(Mutex::new(LocalRb::new(FFT_SIZE))),
-            fft_planner: rustfft::FftPlanner::<f32>::new(),
-            playing: Arc::new(Mutex::new(false)),
+        Self {
+            playing: false,
+            input: VecDeque::new(),
+            output: LocalRb::new(8192),
+            mic: Some(LocalRb::new(1024)),
+            trigger: AtomicUsize::new(0),
         }
     }
 }
 
-#[derive(Deref, DerefMut)]
-struct Application {
-    #[deref]
-    #[deref_mut]
-    target: Option<Mutex<RenderTarget>>,
-    context: softbuffer::Context<DisplayHandle<'static>>,
-    draw: DrawCtx,
+struct AudioOutput {
+    ctrl: Arc<Mutex<AudioCtrl>>,
+    stream: cpal::Stream,
+    cfg: cpal::StreamConfig,
 }
 
-impl Application {
-    fn new<T>(event_loop: &EventLoop<T>, ctx: DrawCtx) -> Self {
-        Application {
-            target: None,
-            context: softbuffer::Context::new(unsafe {
-                std::mem::transmute(event_loop.display_handle().unwrap())
-            })
-            .unwrap(),
-            draw: ctx,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderWaveformGraph {
+    Raw,
+    Semitone,
+}
+
+struct RenderCtrl {
+    waveform: Vec<f32>,
+    fft_planner: rustfft::FftPlanner<f32>,
+    graph_mode: RenderWaveformGraph,
+}
+
+impl RenderCtrl {
+    fn new() -> Self {
+        Self {
+            waveform: Vec::new(),
+            fft_planner: rustfft::FftPlanner::new(),
+            graph_mode: RenderWaveformGraph::Raw,
         }
     }
-    fn target(&mut self) -> MutexGuard<RenderTarget> {
-        self.target.as_mut().unwrap().lock().unwrap()
-    }
-}
 
-#[derive(Debug)]
-enum AppEvent {
-    Redraw,
-}
+    fn fft(&mut self, data: &[f32]) -> Vec<f32> {
+        let mut input = data
+            .iter()
+            .map(|s| Complex::new(*s, 0.0))
+            .collect::<Vec<_>>();
 
-impl ApplicationHandler<AppEvent> for Application {
-    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        let window_attrs = winit::window::WindowAttributes::default()
-            .with_title("Test")
-            .with_active(true)
-            .with_inner_size(LogicalSize::new(800.0, 600.0));
-        let window = event_loop.create_window(window_attrs).unwrap();
-        let target = RenderTarget::new(window, &self.context);
-        self.target = Some(Mutex::new(target));
-    }
-    fn exiting(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
-        self.target = None;
+        let fft = self.fft_planner.plan_fft_forward(input.len());
+        fft.process(&mut input);
+
+        let len_out = input.len() / 2 + 1;
+        let output = &mut input[..len_out];
+        output.iter().map(|c| c.norm()).collect::<Vec<_>>()
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &winit::event_loop::ActiveEventLoop,
-        _window_id: winit::window::WindowId,
-        event: winit::event::WindowEvent,
-    ) {
-        match event {
-            winit::event::WindowEvent::CloseRequested => {
-                event_loop.exit();
-            }
-            winit::event::WindowEvent::Resized(size) => {
-                println!("{:?}", size);
-                let mut target = self.target();
-                target
-                    .surface
-                    .resize(
-                        NonZeroU32::new(size.width).unwrap(),
-                        NonZeroU32::new(size.height).unwrap(),
-                    )
-                    .unwrap();
-                target.pixmap = Pixmap::new(size.width, size.height).unwrap();
-            }
-            winit::event::WindowEvent::RedrawRequested => {
-                let mut target = self.target.as_mut().unwrap().lock().unwrap();
-                let target = target.deref_mut();
-                main_draw(&mut target.pixmap, &mut self.draw);
+    fn compute_waveform(&mut self, data: &[f32]) {
+        let output = self.fft(data);
 
-                let mut buf = target.surface.buffer_mut().unwrap();
-                pixmap_write_to_buffer(&target.pixmap, &mut buf);
-                target.window.pre_present_notify();
-                buf.present().unwrap();
-            }
-            winit::event::WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == winit::event::ElementState::Pressed {
-                    match event.logical_key {
-                        Key::Named(NamedKey::Escape) => {
-                            event_loop.exit();
-                        }
-                        Key::Named(NamedKey::Space) => {
-                            let mut playing = self.draw.playing.lock().unwrap();
-                            *playing = !*playing;
-                        }
-                        _ => {}
+        let mut output = match self.graph_mode {
+            RenderWaveformGraph::Raw => output,
+            RenderWaveformGraph::Semitone => {
+                let freq_start = 20.0f32;
+                let freq_end = output.len() as f32;
+                let freq_step = (1.0 / 12.0f32).exp2() as f32;
+                let mut buckets: Vec<f32> = Vec::with_capacity((freq_end / freq_step) as usize);
+
+                let mut freq_lb = freq_start;
+                loop {
+                    let freq_ub = freq_lb * freq_step;
+                    let freq_ub = freq_ub.min(freq_end);
+
+                    let mut mag = 0.0;
+                    let range = (freq_lb as usize)..(freq_ub as usize);
+                    for i in range.clone() {
+                        mag += output[i];
+                    }
+                    mag /= range.len() as f32;
+                    buckets.push(mag);
+
+                    freq_lb = freq_ub;
+                    if freq_lb >= freq_end {
+                        break;
                     }
                 }
+
+                buckets
             }
-            _ => {}
-        }
-    }
-    fn user_event(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, event: AppEvent) {
-        if self.target.is_some() {
-            match event {
-                AppEvent::Redraw => {
-                    self.target().window.request_redraw();
-                }
-            }
-        }
-    }
-}
-
-fn main() {
-    println!("FFT_SIZE = {}", FFT_SIZE);
-    let event_loop = EventLoop::<AppEvent>::with_user_event().build().unwrap();
-    let event_loop_proxy = event_loop.create_proxy();
-
-    let draw = DrawCtx::new();
-    let recent_samples = Arc::clone(&draw.samples);
-    let playing = Arc::clone(&draw.playing);
-
-    {
-        // `app` must drop before `event_loop``
-        let mut app = Application::new(&event_loop, draw);
-
-        let host = cpal::default_host();
-        let device = host.default_output_device().unwrap();
-        let config = device.default_output_config().unwrap();
-        dbg!(&config);
-
-        let mic_dev = host.default_input_device().unwrap();
-        let mic_config = mic_dev.default_input_config().unwrap();
-        dbg!(&mic_config);
-
-        let mut reader = hound::WavReader::open("asset/48000.wav").unwrap();
-        let spec = reader.spec();
-        println!("{:?}", &spec);
-        let vec_samples = reader
-            .samples::<i16>()
-            .map(|x| x.unwrap().to_sample::<f32>())
-            .collect::<Vec<_>>();
-        let vec_samples: &'static Vec<f32> = unsafe { std::mem::transmute(&vec_samples) };
-        let mut it_samples = vec_samples.iter().cycle();
-
-        let (mut mic_tx, mut mic_rx) = {
-            let mic_buf: StaticRb<f32, 1024> = Default::default();
-            mic_buf.split()
         };
 
-        let mic = mic_dev
-            .build_input_stream(
-                &mic_config.clone().into(),
-                move |data: &[f32], _info: &cpal::InputCallbackInfo| {
-                    mic_tx.push_iter(data.iter().step_by(mic_config.channels() as usize).cloned());
-                },
-                move |err| {
-                    eprintln!("an error occurred on stream: {}", err);
-                },
-                None,
-            )
-            .unwrap();
+        let max = slice_max(&output);
+        output.iter_mut().for_each(|x| *x /= max);
 
-        let stream = device
-            .build_output_stream(
-                &config.clone().into(),
-                move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-                    let playing = {
-                        let playing = playing.lock().unwrap();
-                        *playing
-                    };
+        self.waveform.clear();
+        self.waveform.extend(&output);
+    }
+}
 
-                    if playing {
-                        for (channels, s) in data.chunks_exact_mut(2).zip(it_samples.by_ref()) {
-                            for chl in channels.iter_mut() {
-                                *chl = s * AMP;
-                            }
-                        }
-                    } else {
-                        // for chl in data.iter_mut() {
-                        //     *chl = 0.0;
-                        // }
-                        let channels = config.channels() as usize;
-                        for (channels, s) in data.chunks_exact_mut(channels).zip(mic_rx.pop_iter())
+struct App {
+    render: RenderCtrl,
+    output: AudioOutput,
+    _mic: cpal::Stream,
+    controls: bool,
+    max_hertz: usize,
+}
+
+impl App {
+    fn new(cc: &eframe::CreationContext<'_>) -> App {
+        let ctx = cc.egui_ctx.clone();
+        let stream_out = spawn_stream_output(move || {
+            ctx.request_repaint();
+        });
+        let stream_in = spawn_stream_input(&stream_out.ctrl);
+        let fft_size = stream_out.ctrl.lock().output.capacity().get();
+
+        let app = App {
+            render: RenderCtrl::new(),
+            output: stream_out,
+            _mic: stream_in,
+            controls: true,
+            max_hertz: fft_size / 2 + 1,
+        };
+        // TODO: Loading from ui?
+        app.output
+            .ctrl
+            .lock()
+            .input
+            .extend(tmp_load_data_from_wav().drain(..));
+
+        app
+    }
+}
+
+fn slice_max(data: &[f32]) -> f32 {
+    data.iter().cloned().reduce(f32::max).unwrap()
+}
+
+const fn optimal_fft_size_atleast(minimum: usize) -> usize {
+    let mut best = minimum.next_power_of_two();
+    let mut p2 = best.trailing_zeros();
+    while best > minimum && p2 > 0 {
+        p2 -= 1;
+        let remain = minimum >> p2;
+        let p3 = remain.ilog(3);
+        let mut v = (1_usize << p2) * 3_usize.pow(p3);
+        if v < minimum {
+            v *= 3;
+        }
+        if v < best {
+            best = v;
+        }
+    }
+    best
+}
+
+fn tmp_load_data_from_wav() -> Vec<f32> {
+    let mut reader = hound::WavReader::open("asset/48000.wav").unwrap();
+    let spec = reader.spec();
+    println!("{:?}", &spec);
+    let vec_samples = reader
+        .samples::<i16>()
+        .map(|x| x.unwrap().to_sample::<f32>())
+        .collect::<Vec<_>>();
+    println!("Loaded!");
+    vec_samples
+}
+
+fn paint_waveform(ui: &mut egui::Ui, space: egui::Rect, data: &[f32]) {
+    let painter = ui.painter();
+    let stroke = egui::Stroke::new(4.0, egui::Color32::LIGHT_BLUE);
+
+    let remap = |x: f32, y: f32| {
+        let x = x * (space.max.x - space.min.x) / data.len() as f32 + space.min.x;
+        let diff = (space.max.y - space.min.y) / 2.0 * y;
+        let y = space.min.y + (space.max.y - space.min.y) / 2.0;
+        (x, y + diff, y - diff)
+    };
+
+    for (i, dp) in data.iter().enumerate() {
+        let (x, y_lb, y_ub) = remap(i as f32, *dp).into();
+        painter.vline(x, egui::Rangef::new(y_lb, y_ub), stroke);
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // TODO: This is way too much locking
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::C)) {
+            self.controls = !self.controls;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
+            let mut ctrl = self.output.ctrl.lock();
+            ctrl.playing = !ctrl.playing;
+            if ctrl.playing {
+                self.output.stream.play().unwrap();
+            } else {
+                self.output.stream.pause().unwrap();
+            }
+        }
+
+        egui::Window::new("Controls")
+            .open(&mut self.controls)
+            .show(ctx, |ui| {
+                let mut ctrl = self.output.ctrl.lock();
+
+                ui.checkbox(&mut ctrl.playing, "Playing");
+
+                ui.label(format!(
+                    "Stream Length: {:.2} s",
+                    ctrl.input.len() as f32 / self.output.cfg.sample_rate.0 as f32
+                ));
+
+                let cpu_usage = _frame.info().cpu_usage;
+                ui.label(if let Some(usage) = cpu_usage {
+                    format!("UI Time: {:.2} ms", usage * 1000.0)
+                } else {
+                    "UI Time: N/A".to_string()
+                });
+
+                let mut mic = ctrl.mic.is_some();
+                if ui.checkbox(&mut mic, "Mic").changed() {
+                    ctrl.mic = if mic { Some(LocalRb::new(1024)) } else { None };
+                }
+
+                egui::ComboBox::from_label("Graph Mode")
+                    .selected_text(format!("{:?}", self.render.graph_mode))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.render.graph_mode,
+                            RenderWaveformGraph::Raw,
+                            "Raw",
+                        );
+                        ui.selectable_value(
+                            &mut self.render.graph_mode,
+                            RenderWaveformGraph::Semitone,
+                            "Semitone",
+                        );
+                    });
+
+                if ui.button("Serialise Wave Form Data").clicked() {
+                    use std::io::Write;
+                    let mut file = std::fs::File::create("waveform.csv").unwrap();
+                    writeln!(file, "Magnitude").unwrap();
+                    for point in &self.render.waveform {
+                        writeln!(file, "{}", point).unwrap();
+                    }
+                }
+
+                if ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.max_hertz,
+                            64..=(optimal_fft_size_atleast(20_000 * 2) / 2 + 1),
+                        )
+                        .logarithmic(true)
+                        .text("Hertz"),
+                    )
+                    .changed()
+                {
+                    let fft_size = optimal_fft_size_atleast(self.max_hertz * 2);
+                    self.max_hertz = fft_size / 2 + 1;
+                    if fft_size != ctrl.output.capacity().get() {
+                        let mut buffer = LocalRb::new(fft_size);
+                        buffer.push_iter_overwrite(ctrl.output.pop_iter());
+                        ctrl.output = buffer;
+                    }
+                }
+
+                let fft_size = ctrl.output.capacity().get();
+                ui.label(format!(
+                    "FFT: {} frames {:.2} ms",
+                    fft_size,
+                    fft_size as f32 / self.output.cfg.sample_rate.0 as f32 * 1_000.0
+                ));
+
+                ui.label(format!(
+                    "Triggers: {}",
+                    ctrl.trigger.load(std::sync::atomic::Ordering::Acquire)
+                ));
+
+                if ui.button("Load WAV").clicked() {
+                    let ctrl = Arc::clone(&self.output.ctrl);
+                    // TODO: Lot of overhead :(
+                    std::thread::spawn(move || {
+                        if let Some(filepath) = rfd::FileDialog::new()
+                            .add_filter("WAV", &["wav"])
+                            .pick_file()
                         {
-                            for chl in channels.iter_mut() {
-                                *chl = s * AMP;
-                            }
+                            let mut reader = hound::WavReader::open(filepath).unwrap();
+                            let spec = reader.spec();
+                            println!("{:?}", &spec);
+                            let mut ctrl = ctrl.lock();
+                            ctrl.input.clear();
+                            ctrl.input.extend(
+                                reader
+                                    .samples::<i16>()
+                                    .step_by(spec.channels as usize)
+                                    .map(|x| x.unwrap().to_sample::<f32>()),
+                            );
                         }
-                    }
+                    });
+                }
+            });
+        egui::CentralPanel::default()
+            .frame(egui::Frame {
+                fill: egui::Color32::BLACK,
+                inner_margin: egui::Margin::same(5.0),
+                ..Default::default()
+            })
+            .show(ctx, |ui| {
+                // TODO: Get space and rect better? Use rect transform
+                let space = ui.available_rect_before_wrap();
 
-                    let redraw = {
-                        let mut samples = recent_samples.lock().unwrap();
-                        samples.push_iter_overwrite(data.iter().step_by(2).cloned());
-                        // samples.len() >= FFT_SIZE
-                        true
-                    };
-                    if redraw {
-                        event_loop_proxy.send_event(AppEvent::Redraw).unwrap();
+                // TODO: Not here
+                {
+                    {
+                        let input = {
+                            let ctrl = self.output.ctrl.lock();
+                            ctrl.trigger.store(0, std::sync::atomic::Ordering::Release);
+                            ctrl.output.iter().cloned().collect::<Vec<_>>()
+                        };
+                        self.render.compute_waveform(&input);
                     }
-                },
-                move |err| {
-                    eprintln!("an error occurred on stream: {}", err);
-                },
-                None,
-            )
-            .unwrap();
-        stream.play().unwrap();
-        mic.play().unwrap();
+                }
+                paint_waveform(ui, space, &self.render.waveform);
+            });
+    }
+}
 
-        event_loop.run_app(&mut app).unwrap();
+fn audio_stream_output(
+    ctrl: &mut AudioCtrl,
+    config: &cpal::StreamConfig,
+    data: &mut [f32],
+) -> bool {
+    if !ctrl.playing {
+        for s in data.iter_mut() {
+            *s = 0.0;
+        }
+        return false;
     }
 
-    // const FILENAME: &str = "asset/am.wav";
-    // now_i_know_what_im_doing(FILENAME, 1024, 1);
+    fn write<T: Copy + Default>(
+        d: impl Iterator<Item = T>,
+        data: &mut [T],
+        output: &mut impl ringbuf::traits::RingBuffer<Item = T>,
+        channels: usize,
+    ) {
+        for (channels, sample) in data
+            .chunks_exact_mut(channels)
+            .zip(d.chain(std::iter::repeat(Default::default())))
+        {
+            for channel in channels {
+                *channel = sample;
+            }
+            output.push_overwrite(sample);
+        }
+    }
+
+    let frames = data.len() / 2;
+
+    if let Some(mic) = &mut ctrl.mic {
+        write(
+            mic.pop_iter().take(frames),
+            data,
+            &mut ctrl.output,
+            config.channels as usize,
+        );
+    } else {
+        let avaliable = ctrl.input.len().min(frames);
+        write(
+            ctrl.input.drain(..avaliable),
+            data,
+            &mut ctrl.output,
+            config.channels as usize,
+        );
+    };
+
+    ctrl.trigger
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    true
+}
+
+fn audio_stream_input(ctrl: &mut AudioCtrl, config: &cpal::StreamConfig, data: &[f32]) {
+    if let Some(output) = &mut ctrl.mic {
+        for sample in data.chunks_exact(config.channels as usize) {
+            output.push_overwrite(sample[0]);
+        }
+    }
+}
+
+fn spawn_stream_output(notify: impl Fn() -> () + std::marker::Send + 'static) -> AudioOutput {
+    let host = cpal::default_host();
+    let device = host.default_output_device().unwrap();
+    let config = device.default_output_config().unwrap();
+    let config: cpal::StreamConfig = config.into();
+
+    let ctrl = Arc::new(Mutex::new(AudioCtrl::new()));
+    let ctrl_export = Arc::clone(&ctrl);
+    let cfg = config.clone();
+
+    let stream = device
+        .build_output_stream(
+            &config.clone(),
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                if audio_stream_output(&mut ctrl.lock(), &config, data) {
+                    notify();
+                }
+            },
+            move |err| eprintln!("an error occurred on stream: {}", err),
+            None,
+        )
+        .unwrap();
+    stream.play().unwrap();
+    ctrl_export.lock().playing = true;
+
+    AudioOutput {
+        ctrl: ctrl_export,
+        cfg,
+        stream,
+    }
+}
+
+fn spawn_stream_input(ctrl: &Arc<Mutex<AudioCtrl>>) -> cpal::Stream {
+    let host = cpal::default_host();
+    let device = host.default_input_device().unwrap();
+    let config = device.default_input_config().unwrap();
+    let config: cpal::StreamConfig = config.into();
+
+    let ctrl = Arc::clone(ctrl);
+    let stream = device
+        .build_input_stream(
+            &config.clone(),
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                audio_stream_input(&mut ctrl.lock(), &config, data);
+            },
+            move |err| eprintln!("an error occurred on stream: {}", err),
+            None,
+        )
+        .unwrap();
+    stream.play().unwrap();
+
+    stream
+}
+
+fn main() -> eframe::Result {
+    eframe::run_native(
+        "tw_rave",
+        eframe::NativeOptions {
+            viewport: ViewportBuilder::default()
+                .with_active(true)
+                .with_icon(Arc::new(egui::IconData::default()))
+                .with_title("My Cool App")
+                .with_close_button(true),
+            ..Default::default()
+        },
+        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+    )
 }
