@@ -13,3 +13,7 @@ hound = "3.5.1"
 rfd = "0.14.1"
 ringbuf = "0.4.4"
 rustfft = "6.2.0"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
