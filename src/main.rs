@@ -11,12 +11,14 @@ use ringbuf::{
 };
 use rustfft::num_complex::Complex;
 
+// TODO: i16 over f32
+
 struct AudioCtrl {
     playing: bool,
     input: VecDeque<f32>,
     output: LocalRb<ringbuf::storage::Heap<f32>>,
     mic: Option<LocalRb<ringbuf::storage::Heap<f32>>>,
-    trigger: AtomicUsize,
+    cycles: AtomicUsize,
 }
 
 impl AudioCtrl {
@@ -26,7 +28,7 @@ impl AudioCtrl {
             input: VecDeque::new(),
             output: LocalRb::new(8192),
             mic: Some(LocalRb::new(1024)),
-            trigger: AtomicUsize::new(0),
+            cycles: AtomicUsize::new(0),
         }
     }
 }
@@ -47,6 +49,7 @@ struct RenderCtrl {
     waveform: Vec<f32>,
     fft_planner: rustfft::FftPlanner<f32>,
     graph_mode: RenderWaveformGraph,
+    max_history: VecDeque<(std::time::Instant, f32)>,
 }
 
 impl RenderCtrl {
@@ -55,6 +58,7 @@ impl RenderCtrl {
             waveform: Vec::new(),
             fft_planner: rustfft::FftPlanner::new(),
             graph_mode: RenderWaveformGraph::Raw,
+            max_history: VecDeque::with_capacity(1024),
         }
     }
 
@@ -77,41 +81,54 @@ impl RenderCtrl {
 
         let mut output = match self.graph_mode {
             RenderWaveformGraph::Raw => output,
-            RenderWaveformGraph::Semitone => {
-                let freq_start = 20.0f32;
-                let freq_end = output.len() as f32;
-                let freq_step = (1.0 / 12.0f32).exp2();
-                let mut buckets: Vec<f32> = Vec::with_capacity((freq_end / freq_step) as usize);
-
-                let mut freq_lb = freq_start;
-                loop {
-                    let freq_ub = freq_lb * freq_step;
-                    let freq_ub = freq_ub.min(freq_end);
-
-                    let mut mag = 0.0;
-                    let range = (freq_lb as usize)..(freq_ub as usize);
-                    for i in range.clone() {
-                        mag += output[i];
-                    }
-                    mag /= range.len() as f32;
-                    buckets.push(mag);
-
-                    freq_lb = freq_ub;
-                    if freq_lb >= freq_end {
-                        break;
-                    }
-                }
-
-                buckets
-            }
+            RenderWaveformGraph::Semitone => bucket_semitone(&output),
         };
 
-        let max = slice_max(&output);
+        let time = std::time::Instant::now();
+        let max = it_max_f32(output.iter().copied());
+
+        let pp = self
+            .max_history
+            .partition_point(|(t, _)| (time - *t) > std::time::Duration::from_secs(1));
+        self.max_history.drain(..pp);
+        self.max_history.push_back((time, max));
+
+        let max = it_max_f32(self.max_history.iter().map(|(_, m)| *m));
+
+        // TODO: Use rect transform for the normalisation in one step.
         output.iter_mut().for_each(|x| *x /= max);
 
         self.waveform.clear();
         self.waveform.extend(&output);
     }
+}
+
+fn bucket_semitone(data: &[f32]) -> Vec<f32> {
+    let freq_start = 20.0f32;
+    let freq_end = data.len() as f32;
+    let freq_step = (1.0 / 12.0f32).exp2();
+    let mut buckets: Vec<f32> = Vec::with_capacity((freq_end / freq_step) as usize);
+
+    let mut freq_lb = freq_start;
+    loop {
+        let freq_ub = freq_lb * freq_step;
+        let freq_ub = freq_ub.min(freq_end);
+
+        let mut mag = 0.0;
+        let range = (freq_lb as usize)..(freq_ub as usize);
+        for i in range.clone() {
+            mag += data[i];
+        }
+        mag /= range.len() as f32;
+        buckets.push(mag);
+
+        freq_lb = freq_ub;
+        if freq_lb >= freq_end {
+            break;
+        }
+    }
+
+    buckets
 }
 
 struct App {
@@ -138,19 +155,13 @@ impl App {
             controls: true,
             max_hertz: fft_size / 2 + 1,
         };
-        // TODO: Loading from ui?
-        app.output
-            .ctrl
-            .lock()
-            .input
-            .extend(tmp_load_data_from_wav().drain(..));
 
         app
     }
 }
 
-fn slice_max(data: &[f32]) -> f32 {
-    data.iter().copied().reduce(f32::max).unwrap()
+fn it_max_f32(it: impl Iterator<Item = f32>) -> f32 {
+    it.reduce(f32::max).unwrap()
 }
 
 const fn optimal_fft_size_atleast(minimum: usize) -> usize {
@@ -169,18 +180,6 @@ const fn optimal_fft_size_atleast(minimum: usize) -> usize {
         }
     }
     best
-}
-
-fn tmp_load_data_from_wav() -> Vec<f32> {
-    let mut reader = hound::WavReader::open("asset/48000.wav").unwrap();
-    let spec = reader.spec();
-    println!("{:?}", &spec);
-    let vec_samples = reader
-        .samples::<i16>()
-        .map(|x| x.unwrap().to_sample::<f32>())
-        .collect::<Vec<_>>();
-    println!("Loaded!");
-    vec_samples
 }
 
 fn paint_waveform(ui: &mut egui::Ui, space: egui::Rect, data: &[f32]) {
@@ -295,8 +294,8 @@ impl eframe::App for App {
                 ));
 
                 ui.label(format!(
-                    "Triggers: {}",
-                    ctrl.trigger.load(std::sync::atomic::Ordering::Acquire)
+                    "Cycles: {}",
+                    ctrl.cycles.load(std::sync::atomic::Ordering::Acquire)
                 ));
 
                 if ui.button("Load WAV").clicked() {
@@ -337,7 +336,7 @@ impl eframe::App for App {
                     {
                         let input = {
                             let ctrl = self.output.ctrl.lock();
-                            ctrl.trigger.store(0, std::sync::atomic::Ordering::Release);
+                            ctrl.cycles.store(0, std::sync::atomic::Ordering::Release);
                             ctrl.output.iter().copied().collect::<Vec<_>>()
                         };
                         self.render.compute_waveform(&input);
@@ -396,7 +395,7 @@ fn audio_stream_output(
         );
     };
 
-    ctrl.trigger
+    ctrl.cycles
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     true
