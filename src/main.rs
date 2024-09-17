@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    f32::consts::PI,
     sync::{atomic::AtomicUsize, Arc},
 };
 
@@ -44,12 +45,19 @@ enum RenderWaveformGraph {
     Raw,
     Semitone,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderWaveformWindow {
+    Raw,
+    Hann,
+}
 
 struct RenderCtrl {
     waveform: Vec<f32>,
     fft_planner: rustfft::FftPlanner<f32>,
     graph_mode: RenderWaveformGraph,
+    window: RenderWaveformWindow,
     max_history: VecDeque<(std::time::Instant, f32)>,
+    mag_time: f32,
 }
 
 impl RenderCtrl {
@@ -58,7 +66,9 @@ impl RenderCtrl {
             waveform: Vec::new(),
             fft_planner: rustfft::FftPlanner::new(),
             graph_mode: RenderWaveformGraph::Raw,
+            window: RenderWaveformWindow::Raw,
             max_history: VecDeque::with_capacity(1024),
+            mag_time: 1.0,
         }
     }
 
@@ -76,7 +86,12 @@ impl RenderCtrl {
         output.iter().map(|c| c.norm()).collect::<Vec<_>>()
     }
 
-    fn compute_waveform(&mut self, data: &[f32]) {
+    fn compute_waveform(&mut self, data: &mut [f32]) {
+        match self.window {
+            RenderWaveformWindow::Raw => {}
+            RenderWaveformWindow::Hann => hann_window(data),
+        }
+
         let output = self.fft(data);
 
         let mut output = match self.graph_mode {
@@ -87,9 +102,9 @@ impl RenderCtrl {
         let time = std::time::Instant::now();
         let max = it_max_f32(output.iter().copied());
 
-        let pp = self
-            .max_history
-            .partition_point(|(t, _)| (time - *t) > std::time::Duration::from_secs(1));
+        let pp = self.max_history.partition_point(|(t, _)| {
+            (time - *t) > std::time::Duration::from_secs_f32(self.mag_time)
+        });
         self.max_history.drain(..pp);
         self.max_history.push_back((time, max));
 
@@ -100,6 +115,14 @@ impl RenderCtrl {
 
         self.waveform.clear();
         self.waveform.extend(&output);
+    }
+}
+
+fn hann_window(samples: &mut [f32]) {
+    let size = samples.len();
+    for (i, s) in samples.iter_mut().enumerate() {
+        let w = 0.5 - 0.5 * (2.0 * PI * i as f32 / size as f32).cos();
+        *s *= w;
     }
 }
 
@@ -232,9 +255,9 @@ impl eframe::App for App {
 
                 let cpu_usage = frame.info().cpu_usage;
                 ui.label(if let Some(usage) = cpu_usage {
-                    format!("UI Time: {:.2} ms", usage * 1000.0)
+                    format!("UI Time: {:.2} ms FPS {:.2}", usage * 1000.0, 1.0 / usage)
                 } else {
-                    "UI Time: N/A".to_string()
+                    "UI Time: N/A FPS: N/A".to_string()
                 });
 
                 let mut mic = ctrl.mic.is_some();
@@ -254,6 +277,21 @@ impl eframe::App for App {
                             &mut self.render.graph_mode,
                             RenderWaveformGraph::Semitone,
                             "Semitone",
+                        );
+                    });
+
+                egui::ComboBox::from_label("Window")
+                    .selected_text(format!("{:?}", self.render.window))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.render.window,
+                            RenderWaveformWindow::Raw,
+                            "Raw",
+                        );
+                        ui.selectable_value(
+                            &mut self.render.window,
+                            RenderWaveformWindow::Hann,
+                            "Hann",
                         );
                     });
 
@@ -298,6 +336,9 @@ impl eframe::App for App {
                     ctrl.cycles.load(std::sync::atomic::Ordering::Acquire)
                 ));
 
+                ui.label("Mag History Window");
+                ui.add(egui::Slider::new(&mut self.render.mag_time, 0.0..=10.0).text("s"));
+
                 if ui.button("Load WAV").clicked() {
                     let ctrl = Arc::clone(&self.output.ctrl);
                     // TODO: Lot of overhead :(
@@ -309,14 +350,15 @@ impl eframe::App for App {
                             let mut reader = hound::WavReader::open(filepath).unwrap();
                             let spec = reader.spec();
                             println!("{:?}", &spec);
+                            // Collect to prevent lock contention
+                            let data = reader
+                                .samples::<i16>()
+                                .step_by(spec.channels as usize)
+                                .map(|x| x.unwrap().to_sample::<f32>())
+                                .collect::<Vec<_>>();
                             let mut ctrl = ctrl.lock();
                             ctrl.input.clear();
-                            ctrl.input.extend(
-                                reader
-                                    .samples::<i16>()
-                                    .step_by(spec.channels as usize)
-                                    .map(|x| x.unwrap().to_sample::<f32>()),
-                            );
+                            ctrl.input.extend(data);
                         }
                     });
                 }
@@ -334,12 +376,12 @@ impl eframe::App for App {
                 // TODO: Not here
                 {
                     {
-                        let input = {
+                        let mut input = {
                             let ctrl = self.output.ctrl.lock();
                             ctrl.cycles.store(0, std::sync::atomic::Ordering::Release);
                             ctrl.output.iter().copied().collect::<Vec<_>>()
                         };
-                        self.render.compute_waveform(&input);
+                        self.render.compute_waveform(&mut input);
                     }
                 }
                 paint_waveform(ui, space, &self.render.waveform);
