@@ -15,5 +15,5 @@ ringbuf = "0.4.4"
 rustfft = "6.2.0"
 
 [profile.release]
-lto = "fat"
+lto = true
 codegen-units = 1
