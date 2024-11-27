@@ -1,18 +1,21 @@
 use std::{
     collections::VecDeque,
     f32::consts::PI,
-    sync::{atomic::AtomicUsize, Arc},
+    sync::{atomic::AtomicUsize, Arc, Mutex},
+    time::Duration,
 };
 
 use cpal::{traits::*, Sample};
-use egui::{mutex::Mutex, ViewportBuilder};
-use ringbuf::{
-    traits::{Consumer, Observer, RingBuffer},
-    LocalRb,
-};
+use egui::ViewportBuilder;
+use hertz::FFTHertz;
+use ringbuf::{traits::*, LocalRb};
+use rodio::Source;
 use rustfft::num_complex::Complex;
 
-// TODO: i16 over f32
+mod gui;
+mod hertz;
+mod pipeline;
+mod playback;
 
 struct AudioCtrl {
     playing: bool,
@@ -159,7 +162,7 @@ struct App {
     output: AudioOutput,
     _mic: cpal::Stream,
     controls: bool,
-    max_hertz: usize,
+    max_hertz: FFTHertz,
 }
 
 impl App {
@@ -169,14 +172,14 @@ impl App {
             ctx.request_repaint();
         });
         let stream_in = spawn_stream_input(&stream_out.ctrl);
-        let fft_size = stream_out.ctrl.lock().output.capacity().get();
+        let fft_size = stream_out.ctrl.lock().unwrap().output.capacity().get();
 
         let app = App {
             render: RenderCtrl::new(),
             output: stream_out,
             _mic: stream_in,
             controls: true,
-            max_hertz: fft_size / 2 + 1,
+            max_hertz: FFTHertz::from_fft_size(fft_size),
         };
 
         app
@@ -185,24 +188,6 @@ impl App {
 
 fn it_max_f32(it: impl Iterator<Item = f32>) -> f32 {
     it.reduce(f32::max).unwrap()
-}
-
-const fn optimal_fft_size_atleast(minimum: usize) -> usize {
-    let mut best = minimum.next_power_of_two();
-    let mut p2 = best.trailing_zeros();
-    while best > minimum && p2 > 0 {
-        p2 -= 1;
-        let remain = minimum >> p2;
-        let p3 = remain.ilog(3);
-        let mut v = (1_usize << p2) * 3_usize.pow(p3);
-        if v < minimum {
-            v *= 3;
-        }
-        if v < best {
-            best = v;
-        }
-    }
-    best
 }
 
 fn paint_waveform(ui: &mut egui::Ui, space: egui::Rect, data: &[f32]) {
@@ -231,8 +216,16 @@ impl eframe::App for App {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::C)) {
             self.controls = !self.controls;
         }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::M)) {
+            let mut ctrl = self.output.ctrl.lock().unwrap();
+            ctrl.mic = if ctrl.mic.is_some() {
+                None
+            } else {
+                Some(LocalRb::new(1024))
+            };
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
-            let mut ctrl = self.output.ctrl.lock();
+            let mut ctrl = self.output.ctrl.lock().unwrap();
             ctrl.playing = !ctrl.playing;
             if ctrl.playing {
                 self.output.stream.play().unwrap();
@@ -244,7 +237,7 @@ impl eframe::App for App {
         egui::Window::new("Controls")
             .open(&mut self.controls)
             .show(ctx, |ui| {
-                let mut ctrl = self.output.ctrl.lock();
+                let mut ctrl = self.output.ctrl.lock().unwrap();
 
                 ui.checkbox(&mut ctrl.playing, "Playing");
 
@@ -304,21 +297,21 @@ impl eframe::App for App {
                     }
                 }
 
+                let mut max_hertz = self.max_hertz.hertz();
                 if ui
                     .add(
                         egui::Slider::new(
-                            &mut self.max_hertz,
-                            64..=(optimal_fft_size_atleast(20_000 * 2) / 2 + 1),
+                            &mut max_hertz,
+                            64..=(FFTHertz::from_hertz(20_000).optimal().hertz()),
                         )
                         .logarithmic(true)
                         .text("Hertz"),
                     )
                     .changed()
                 {
-                    let fft_size = optimal_fft_size_atleast(self.max_hertz * 2);
-                    self.max_hertz = fft_size / 2 + 1;
-                    if fft_size != ctrl.output.capacity().get() {
-                        let mut buffer = LocalRb::new(fft_size);
+                    self.max_hertz = FFTHertz::from_hertz(max_hertz).optimal();
+                    if self.max_hertz.fft_size() != ctrl.output.capacity().get() {
+                        let mut buffer = LocalRb::new(self.max_hertz.fft_size());
                         buffer.push_iter_overwrite(ctrl.output.pop_iter());
                         ctrl.output = buffer;
                     }
@@ -356,7 +349,7 @@ impl eframe::App for App {
                                 .step_by(spec.channels as usize)
                                 .map(|x| x.unwrap().to_sample::<f32>())
                                 .collect::<Vec<_>>();
-                            let mut ctrl = ctrl.lock();
+                            let mut ctrl = ctrl.lock().unwrap();
                             ctrl.input.clear();
                             ctrl.input.extend(data);
                         }
@@ -377,7 +370,7 @@ impl eframe::App for App {
                 {
                     {
                         let mut input = {
-                            let ctrl = self.output.ctrl.lock();
+                            let ctrl = self.output.ctrl.lock().unwrap();
                             ctrl.cycles.store(0, std::sync::atomic::Ordering::Release);
                             ctrl.output.iter().copied().collect::<Vec<_>>()
                         };
@@ -465,7 +458,7 @@ fn spawn_stream_output(notify: impl Fn() + std::marker::Send + 'static) -> Audio
         .build_output_stream(
             &config.clone(),
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                if audio_stream_output(&mut ctrl.lock(), &config, data) {
+                if audio_stream_output(&mut ctrl.lock().unwrap(), &config, data) {
                     notify();
                 }
             },
@@ -474,7 +467,7 @@ fn spawn_stream_output(notify: impl Fn() + std::marker::Send + 'static) -> Audio
         )
         .unwrap();
     stream.play().unwrap();
-    ctrl_export.lock().playing = true;
+    ctrl_export.lock().unwrap().playing = true;
 
     AudioOutput {
         ctrl: ctrl_export,
@@ -494,7 +487,7 @@ fn spawn_stream_input(ctrl: &Arc<Mutex<AudioCtrl>>) -> cpal::Stream {
         .build_input_stream(
             &config.clone(),
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                audio_stream_input(&mut ctrl.lock(), &config, data);
+                audio_stream_input(&mut ctrl.lock().unwrap(), &config, data);
             },
             move |err| eprintln!("an error occurred on stream: {err}"),
             None,
