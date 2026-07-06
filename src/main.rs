@@ -6,8 +6,7 @@ mod app;
 mod audio;
 mod host;
 mod ui;
-
-mod controller;
+// mod controller;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = ratatui::init();

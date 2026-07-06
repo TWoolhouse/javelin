@@ -1,13 +1,13 @@
-use std::time::Duration;
+use std::{any::type_name_of_val, fmt::Debug, time::Duration};
 
 use cpal::{
     StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 
-use crate::audio::fft::FFTBufferTX;
+use crate::audio::fft::{FFTBufferRX, FFTBufferTX};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Device {
     pub inner: cpal::Device,
     pub config: StreamConfig,
@@ -38,6 +38,8 @@ impl TryFrom<cpal::Device> for Device {
 
 impl Device {
     pub fn try_default() -> Result<Self, cpal::Error> {
+        // FIXME: This assumes a lot of things about the kind of device / direction
+        // Needs to be more explicit
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -47,33 +49,56 @@ impl Device {
     }
 }
 
-pub fn create_stream_as_input_from_output_device(
-    device: Device,
-    mut fft_tx: FFTBufferTX,
-) -> Result<cpal::Stream, cpal::Error> {
-    let channels = device.config.channels as usize;
-    let mut scratch = vec![Default::default(); fft_tx.len()];
+pub struct Stream {
+    pub inner: cpal::Stream,
+    pub buffer: FFTBufferRX,
+}
 
-    let stream = device.inner.build_input_stream(
-        device.config.clone(),
-        move |data: &[f32], info| {
-            // Remove any extra samples that don't fit into the FFT buffer
-            let data = &data[data.len().saturating_sub(fft_tx.len()) * channels..];
-            let sample_count = data.len() / channels;
+impl Device {
+    pub fn create_stream_as_input_from_output_device(
+        &self,
+        mut fft_tx: FFTBufferTX,
+        fft_rx: FFTBufferRX,
+    ) -> Result<Stream, cpal::Error> {
+        let channels = self.config.channels as usize;
+        let mut scratch = vec![Default::default(); fft_tx.len()];
+        let sample_count_input = fft_tx.len() * channels;
 
-            // Average the channels into mono, write to the scratch
-            data.chunks(channels)
-                .map(|chunk| chunk.into_iter().sum::<f32>() / channels as f32)
-                .zip(scratch.iter_mut())
-                .for_each(|(s, scratch)| *scratch = s);
+        let stream = self.inner.build_input_stream(
+            self.config.clone(),
+            move |data: &[f32], info| {
+                // Remove any extra samples that don't fit into the FFT buffer
+                let skip = data.len().saturating_sub(sample_count_input);
+                let data_end = &data[skip..];
+                let sample_count_output = data_end.len() / channels;
 
-            fft_tx.write(&scratch[..sample_count]);
-        },
-        |err| {
-            eprintln!("Error occurred on input stream: {}", err);
-        },
-        Some(Duration::from_secs(5)),
-    )?;
-    stream.play()?;
-    Ok(stream)
+                // Average the channels into mono, write to the scratch
+                data_end
+                    .chunks(channels)
+                    .map(|chunk| chunk.into_iter().sum::<f32>() / channels as f32)
+                    .zip(scratch.iter_mut())
+                    .for_each(|(s, scratch)| *scratch = s);
+
+                fft_tx.write(&scratch[..sample_count_output]);
+            },
+            |err| {
+                eprintln!("Error occurred on input stream: {}", err);
+            },
+            Some(Duration::from_secs(5)),
+        )?;
+        stream.play()?;
+        Ok(Stream {
+            inner: stream,
+            buffer: fft_rx,
+        })
+    }
+}
+
+impl Debug for Stream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(type_name_of_val(self))
+            .field("stream", &"active")
+            .field("buffer", &self.buffer)
+            .finish()
+    }
 }

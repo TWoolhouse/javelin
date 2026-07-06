@@ -21,19 +21,23 @@ impl Widget for &mut App {
         let bars = fft_pass
             .samples
             .array_windows::<2>()
-            .map(|[sample, next]| Rectangle {
-                x: sample.freq_lin as f64,
-                y: -sample.linear as f64,
-                width: (next.freq_lin - sample.freq_lin) as f64,
-                height: (sample.linear * 2.0) as f64,
-                ..Default::default()
+            .map(|[sample, next]| {
+                let freq_lin = crate::app::db::linearise_frequency(sample.freq);
+                let next_freq_lin = crate::app::db::linearise_frequency(next.freq);
+                Rectangle {
+                    x: freq_lin as f64,
+                    y: -sample.amp as f64,
+                    width: (next_freq_lin - freq_lin) as f64,
+                    height: (sample.amp * 2.0) as f64,
+                    ..Default::default()
+                }
             })
             .collect::<Vec<_>>();
 
         let max_now = (
             Instant::now(),
-            fft_pass.peak_sample().linear as f32,
-            fft_pass.samples.into_iter().map(|s| s.linear).collect(),
+            fft_pass.peak_sample().amp as f32,
+            fft_pass.samples.into_iter().map(|s| s.amp).collect(),
         );
 
         let pp = self
@@ -54,6 +58,9 @@ impl Widget for &mut App {
 
         let render_min = db_to_linear(-160.0) as f64;
 
+        // HACK: 75% to allow bass to go off screen, to show the rest of the spectrum better, as bass is much louder than the rest of the spectrum.
+        let render_bounds = (max_height * 0.65).max(render_min);
+
         Canvas::default()
             .block(Block::bordered().title("Canvas").title_bottom(vec![
                 Span::from(format!("{:.2} Hz ", self.resolution().hertz())),
@@ -67,7 +74,7 @@ impl Widget for &mut App {
                 )),
             ]))
             .x_bounds([0.0, 1.0])
-            .y_bounds([-max_height.max(render_min), max_height.max(render_min)])
+            .y_bounds([-render_bounds, render_bounds])
             .paint(|ctx| {
                 bars.iter().for_each(|bar| {
                     ctx.draw(bar);

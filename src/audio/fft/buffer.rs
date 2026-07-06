@@ -9,13 +9,13 @@ pub struct FFTBuffer {
     instant_callback: cpal::StreamInstant,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FFTBufferTX {
     ring: Arc<Mutex<FFTBuffer>>,
     len: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FFTBufferRX {
     ring: Arc<Mutex<FFTBuffer>>,
     buffer: Vec<f32>,

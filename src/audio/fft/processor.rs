@@ -50,6 +50,9 @@ impl FFTProcessor {
     }
 }
 
+/// Gain in power of the Hann window, used to normalize the FFT output.
+pub const HANN_WINDOW_GAIN: f32 = 0.375;
+
 /// Create a Hann window function for the given number of samples.
 pub fn hann_window(n: usize) -> impl Fn(usize) -> f32 {
     move |i: usize| {
