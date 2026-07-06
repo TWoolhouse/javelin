@@ -42,6 +42,7 @@ impl Widget for &mut App {
         self.history_db.drain(..pp);
         self.history_db.push_back(max_now);
 
+        // TODO: Add the falling peak that drops over time kinda thing.
         // let maxes = self.history_db.iter()
 
         let max_height = self

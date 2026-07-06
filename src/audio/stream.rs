@@ -4,7 +4,6 @@ use cpal::{
     StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
-use itertools::Itertools;
 
 use crate::audio::fft::FFTBufferTX;
 
@@ -58,12 +57,12 @@ pub fn create_stream_as_input_from_output_device(
     let stream = device.inner.build_input_stream(
         device.config.clone(),
         move |data: &[f32], info| {
-            // TODO: Average channels instead of just taking the first channel
-            let data_last = &data[data.len().saturating_sub(fft_tx.len()) * channels..];
-            let sample_count = data_last.len() / channels;
+            // Remove any extra samples that don't fit into the FFT buffer
+            let data = &data[data.len().saturating_sub(fft_tx.len()) * channels..];
+            let sample_count = data.len() / channels;
 
-            data_last
-                .chunks(channels)
+            // Average the channels into mono, write to the scratch
+            data.chunks(channels)
                 .map(|chunk| chunk.into_iter().sum::<f32>() / channels as f32)
                 .zip(scratch.iter_mut())
                 .for_each(|(s, scratch)| *scratch = s);

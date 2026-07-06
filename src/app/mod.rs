@@ -4,10 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cpal::{
-    StreamInstant,
-    traits::{DeviceTrait, HostTrait, StreamTrait},
-};
+use cpal::{StreamInstant, traits::StreamTrait};
 use rodio::math::db_to_linear;
 
 mod db;
@@ -28,7 +25,10 @@ pub struct App {
     processor: FFTProcessor,
     stream: Stream,
 
-    // TODO
+    // TODO: Create a `Pipeline` struct that contains the stream, processor, and maybe history for a given configuration.
+    // Then it is easier to switch to a new pipeline when a setting changes
+
+    // TODO: Figure out what is needed for history
     pub history_db: VecDeque<(Instant, f32, Vec<f32>)>,
     pub timestamp: StreamInstant,
     pub timestamp_last: StreamInstant,
@@ -80,7 +80,7 @@ impl App {
     /// Resize the FFT buffer to a new resolution, returning the new resolution.
     /// The new resolution may not be the same as the requested resolution, as it will be adjusted to the nearest optimal resolution.
     pub fn resize(&mut self, resolution: FFTResolution) -> FFTResolution {
-        // TODO: Propagate errors
+        // FIXME: Propagate errors
         let device = Device::try_default().expect("No default audio device available");
 
         let res_new = resolution
@@ -145,6 +145,9 @@ impl App {
         let bin_freq = self.resolution.hertz();
 
         let fft_db = self.fft_db();
+
+        // TODO: Add an EQ curve:
+        // e.g. the bass are much louder, therefore it's hard to see anything else
 
         let samples = fft_db
             .enumerate()

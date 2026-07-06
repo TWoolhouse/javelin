@@ -3,6 +3,12 @@
 /// This converts the frequency to a logarithmic scale.
 /// The table of frequencies is based on the human hearing range, see [linear_frequency_table].
 pub fn linearise_frequency(freq: f32) -> f32 {
+    // TODO: Should linearise the other way to have consistently wide bars.
+    // Requires quantising and taking the max or avg.
+    // TODO: Lerping every time is silly as the frequencies are:
+    //     a) fixed for a given pipeline setup.
+    //     b) monotonic, so we can cache the prior and work forwards etc...
+
     let table = linear_frequency_table();
     let freq = freq.ln();
 
