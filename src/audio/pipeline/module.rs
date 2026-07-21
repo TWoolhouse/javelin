@@ -1,5 +1,5 @@
 use crate::audio::{
-    fft::FFTResolution,
+    fft::{FFTBufferInstant, FFTResolution},
     pipeline::pass::{PassBuilder, PassSpec},
 };
 
@@ -15,6 +15,7 @@ pub struct CaptureSpec {
 #[derive(Debug)]
 pub struct Capture<'s> {
     pub buffer: &'s mut [f32],
+    pub instant: FFTBufferInstant,
 }
 
 pub trait Capturer: PipelineModule<(), CaptureSpec> {

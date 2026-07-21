@@ -1,8 +1,10 @@
+use itertools::Itertools;
+
 use crate::audio::{
     fft::executor::{FFTExecutor, HANN_WINDOW_GAIN, hann_window},
     pipeline::{
         module::{Capture, CaptureSpec, PipelineModule, Transformer},
-        pass::{PassBuilder, PassSpec, RawSamples},
+        pass::{PassBuilder, PassSpec, RawSamples, Sample},
     },
 };
 
@@ -50,11 +52,30 @@ impl Transformer for FFTransform {
                 let power = c.norm_sqr() * self.power_factor;
                 power.max(self.min_power).log10() * 10.0
             })
-            .collect();
+            .collect::<Vec<_>>();
+
+        let loudness = samples
+            .iter()
+            .copied()
+            .enumerate()
+            .minmax_by_key(|&(_, v)| v)
+            .into_option()
+            .expect("Atleast one sample should be present");
 
         PassBuilder {
             samples: RawSamples::from_decibels(samples),
-            idx_max: None,
+            peak: None,
+            loudness: (
+                Sample {
+                    freq: loudness.0.0 as f32 * self.bin_width_hz,
+                    db: loudness.0.1,
+                },
+                Sample {
+                    freq: loudness.1.0 as f32 * self.bin_width_hz,
+                    db: loudness.1.1,
+                },
+            ),
+            instant: capture.instant,
         }
     }
 }

@@ -19,27 +19,30 @@ pub struct DeviceCapture {
 }
 
 impl DeviceCapture {
-    pub fn new(config: &mut DeviceCaptureConfig) -> Self {
+    pub fn new(config: &mut DeviceCaptureConfig) -> Result<Self, ()> {
         config.resolution = config
             .resolution
             .with_sample_rate(config.device.config.sample_rate as usize)
             .optimal();
+        if config.resolution.samples() == 0 {
+            return Err(());
+        }
+
         let (fft_tx, fft_rx) = FFTBuffer::new(config.resolution.samples());
-        Self {
+        Ok(Self {
             resolution: config.resolution,
             stream: config
                 .device
                 .create_stream_as_input_from_output_device(fft_tx, fft_rx)
-                .unwrap(), // FIXME: This can fail in normal operation
-        }
+                .unwrap(), // FIXME: Propagate real error
+        })
     }
 }
 
 impl Capturer for DeviceCapture {
     fn capture(&mut self) -> Capture<'_> {
-        Capture {
-            buffer: self.stream.buffer.slice(),
-        }
+        let (buffer, instant) = self.stream.buffer.slice();
+        Capture { buffer, instant }
     }
 }
 

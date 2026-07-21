@@ -3,6 +3,7 @@ use crate::audio::pipeline::{
     pass::PassSpec,
 };
 
+pub mod history;
 pub mod notes;
 pub mod smooth;
 
@@ -40,6 +41,7 @@ stages! {
 pub enum PostStage {
     Notes(notes::Notes),
     Smooth(smooth::Smooth),
+    History(history::History),
 }
 impl PostStageTrait;
 }

@@ -43,7 +43,6 @@ impl PostStage for StageNotes {
 
         PassBuilder {
             samples: pass.samples,
-            idx_max: None,
             ..pass
         }
     }

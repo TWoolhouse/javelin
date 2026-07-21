@@ -22,11 +22,6 @@ pub struct App {
     pipeline: PipelineReconfigurable,
     pub pass: Pass,
 
-    // TODO: Figure out what is needed for history
-    pub history_db: VecDeque<(Instant, f32, Vec<f32>)>,
-    pub timestamp: StreamInstant,
-    pub timestamp_last: StreamInstant,
-
     tui: crate::ui::terminal::State,
 }
 
@@ -55,14 +50,7 @@ impl Default for App {
     fn default() -> Self {
         Self {
             pipeline: PipelineReconfigurable::default(),
-            pass: Pass {
-                samples: vec![Sample { freq: 0.0, db: 0.0 }; 1],
-                peak: 0,
-            },
-
-            history_db: VecDeque::with_capacity(256),
-            timestamp: StreamInstant::from_nanos(0),
-            timestamp_last: StreamInstant::from_nanos(0),
+            pass: Pass::default(),
 
             tui: crate::ui::terminal::State::default(),
         }

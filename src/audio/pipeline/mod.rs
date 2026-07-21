@@ -27,8 +27,8 @@ impl Pipeline {
         capture: &mut DeviceCaptureConfig,
         transform: &mut FFTransformConfig,
         stages: impl IntoIterator<Item = &'s mut PostStageConfig>,
-    ) -> Self {
-        let capturer = DeviceCapture::new(capture);
+    ) -> Result<Self, ()> {
+        let capturer = DeviceCapture::new(capture)?;
         let spec = capturer.spec(());
         let transformer = FFTransform::new(transform, &spec);
         let mut spec = transformer.spec(spec);
@@ -36,18 +36,18 @@ impl Pipeline {
         let stages = stages.into_iter();
         let mut modules = Vec::with_capacity(stages.size_hint().0);
         for stage_config in stages {
-            let stage = stage_config.build(&spec).unwrap(); // TODO: Handle errors
+            let stage = stage_config.build(&spec)?;
             spec = stage.spec(spec);
             modules.push(stage);
         }
 
-        Self {
+        Ok(Self {
             capturer,
             // pre_stages: Vec::new(),
             transformer,
             post_stages: modules,
             frequencies: spec.frequencies,
-        }
+        })
     }
 
     pub fn run(&mut self) -> Pass {

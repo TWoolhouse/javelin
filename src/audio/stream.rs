@@ -5,7 +5,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 
-use crate::audio::fft::{FFTBufferRX, FFTBufferTX};
+use crate::audio::fft::{FFTBufferInstant, FFTBufferRX, FFTBufferTX};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Device {
@@ -79,7 +79,13 @@ impl Device {
                     .zip(scratch.iter_mut())
                     .for_each(|(s, scratch)| *scratch = s);
 
-                fft_tx.write(&scratch[..sample_count_output]);
+                fft_tx.write(
+                    &scratch[..sample_count_output],
+                    FFTBufferInstant {
+                        device: info.timestamp().capture,
+                        callback: info.timestamp().callback,
+                    },
+                );
             },
             |err| {
                 eprintln!("Error occurred on input stream: {}", err);

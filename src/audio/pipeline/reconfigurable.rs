@@ -2,14 +2,15 @@ use std::time::Duration;
 
 use derive_more::{Deref, DerefMut};
 
-use crate::{
-    audio::pipeline::{
+use crate::audio::{
+    fft::FFTResolution,
+    pipeline::{
         Pipeline,
         capture::DeviceCaptureConfig,
-        stage::{PostStage as PostStageConfig, notes::Notes, smooth::Smooth},
+        stage::{PostStage as PostStageConfig, history::History, notes::Notes, smooth::Smooth},
         transform::FFTransformConfig,
     },
-    audio::{fft::FFTResolution, stream::Device},
+    stream::Device,
 };
 
 #[derive(Deref, DerefMut)]
@@ -28,24 +29,25 @@ impl PipelineReconfigurable {
         mut capturer: DeviceCaptureConfig,
         mut transform: FFTransformConfig,
         mut stages: Vec<PostStageConfig>,
-    ) -> Self {
+    ) -> Result<Self, ()> {
         // TODO: Cloning the configs feels wrong
-        Self {
-            pipeline: Pipeline::new(&mut capturer, &mut transform, stages.iter_mut()),
+        Ok(Self {
+            pipeline: Pipeline::new(&mut capturer, &mut transform, stages.iter_mut())?,
             stages,
             capturer,
             transform,
-        }
+        })
     }
 
-    pub fn reconfigure(&mut self) {
+    pub fn reconfigure(&mut self) -> Result<(), ()> {
         // TODO: We don't have to throw away the entire pipeline, we can reconfigure it in place.
         // But for now, just rebuild it.
         self.pipeline = Pipeline::new(
             &mut self.capturer,
             &mut self.transform,
             self.stages.iter_mut(),
-        );
+        )?;
+        Ok(())
     }
 }
 
@@ -64,7 +66,12 @@ impl Default for PipelineReconfigurable {
                 }
                 .into(),
                 Smooth { bias_new: 0.5 }.into(),
+                History {
+                    cull_duration: Duration::from_secs_f32(0.2),
+                }
+                .into(),
             ],
         )
+        .unwrap()
     }
 }

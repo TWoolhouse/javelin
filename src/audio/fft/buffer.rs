@@ -1,12 +1,20 @@
 use std::sync::{Arc, Mutex};
 
+// TODO: The buffer should keep enough so that we can playback the fft of exactly the time
+// the samples would be played from the device.
+// FIXME: I think the cursor is does not handle all cases
+// therefore it is returning the data backwards?
 #[derive(Debug)]
 pub struct FFTBuffer {
     cursor: usize,
     buffer: Vec<f32>,
-    // TODO: Add this feature
-    instant_device: cpal::StreamInstant,
-    instant_callback: cpal::StreamInstant,
+    instant: FFTBufferInstant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FFTBufferInstant {
+    pub device: cpal::StreamInstant,
+    pub callback: cpal::StreamInstant,
 }
 
 #[derive(Debug, Clone)]
@@ -29,8 +37,7 @@ impl FFTBuffer {
         let buffer = FFTBuffer {
             buffer: vec![f32::default(); capacity],
             cursor: 0,
-            instant_device: cpal::StreamInstant::from_nanos(0),
-            instant_callback: cpal::StreamInstant::from_nanos(0),
+            instant: FFTBufferInstant::default(),
         };
 
         let ring = Arc::new(Mutex::new(buffer));
@@ -47,7 +54,7 @@ impl FFTBuffer {
 }
 
 impl FFTBufferTX {
-    pub fn write(&mut self, samples: &[f32]) {
+    pub fn write(&mut self, samples: &[f32], instant: FFTBufferInstant) {
         // Get the last [self.len] samples from the input slice
         let samples = if samples.len() > self.len {
             &samples[samples.len() - self.len..]
@@ -70,6 +77,7 @@ impl FFTBufferTX {
                 ring.cursor += samples.len();
             }
         }
+        ring.instant = instant;
     }
 
     pub fn len(&self) -> usize {
@@ -78,17 +86,27 @@ impl FFTBufferTX {
 }
 
 impl FFTBufferRX {
-    pub fn slice(&mut self) -> &mut [f32] {
-        {
+    pub fn slice(&mut self) -> (&mut [f32], FFTBufferInstant) {
+        let instant = {
             let ring = self.ring.lock().unwrap();
             let (first, second) = ring.buffer.split_at(ring.cursor);
             self.buffer[..first.len()].copy_from_slice(first);
             self.buffer[first.len()..].copy_from_slice(second);
-        }
-        &mut self.buffer
+            ring.instant.clone()
+        };
+        (&mut self.buffer, instant)
     }
 
     pub fn len(&self) -> usize {
         self.buffer.len()
+    }
+}
+
+impl Default for FFTBufferInstant {
+    fn default() -> Self {
+        Self {
+            device: cpal::StreamInstant::from_nanos(0),
+            callback: cpal::StreamInstant::from_nanos(0),
+        }
     }
 }

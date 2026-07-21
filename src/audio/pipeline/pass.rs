@@ -1,5 +1,10 @@
+use std::convert::identity;
+
+use either::Either;
 use rodio::math::{db_to_linear, linear_to_db};
 use take_mut::take_or_recover;
+
+use crate::audio::fft::FFTBufferInstant;
 
 #[derive(Debug, Clone)]
 pub struct Sample {
@@ -21,19 +26,34 @@ impl Sample {
             db: linear_to_db(amp),
         }
     }
+    pub fn from_amp(freq: f32, amp: f32) -> Self {
+        Self {
+            freq,
+            db: linear_to_db(amp),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Pass {
     pub samples: Vec<Sample>,
-    /// Index of the peak sample in the [samples](Self::samples) vector
-    pub peak: usize,
+    /// The peak sample over the history, see (History)[super::stage::history::History]
+    pub peak: Sample,
+    /// The quietest and loudest samples from the original input.
+    pub loudness: (Sample, Sample),
+    pub instant: FFTBufferInstant,
+    // TODO: Could have vec<enum of extra output data per stage>
+    // instead, just dump all the data directly, assume no duplicates of stages?
 }
 
-impl Pass {
-    pub fn peak_sample(&self) -> &Sample {
-        &self.samples[self.peak]
-    }
+#[derive(Debug)]
+pub struct PassBuilder {
+    pub samples: RawSamples,
+    /// The peak sample over the history, see (History)[super::stage::history::History]
+    pub peak: Option<Sample>,
+    /// The quietest and loudest samples from the original input.
+    pub loudness: (Sample, Sample),
+    pub instant: FFTBufferInstant,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,20 +68,61 @@ impl PassSpec {
     }
 }
 
-#[derive(Debug)]
-pub struct PassBuilder {
-    pub samples: RawSamples,
-    /// Index of the peak sample in the [samples](Self::samples) vector
-    pub idx_max: Option<usize>,
-}
-
 #[derive(Debug, Clone)]
 pub enum RawSamples {
     Decibels(Vec<f32>),
     Amplitudes(Vec<f32>),
 }
 
+impl PassBuilder {
+    pub fn max_idx(&self) -> Option<usize> {
+        self.samples
+            .as_inner()
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                a.partial_cmp(b).unwrap_or_else(|| {
+                    if a.is_finite() {
+                        std::cmp::Ordering::Greater
+                    } else if b.is_finite() {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+            })
+            .map(|(i, _)| i)
+    }
+
+    pub fn build(mut self, frequencies: &[f32]) -> Pass {
+        let peak = self
+            .peak
+            .take()
+            .map(Either::Left)
+            .unwrap_or_else(|| Either::Right(self.max_idx()));
+
+        let samples: Vec<_> = self
+            .samples
+            .into_decibels()
+            .into_iter()
+            .zip(frequencies)
+            .map(|(db, &freq)| Sample { freq, db })
+            .collect();
+
+        Pass {
+            instant: self.instant,
+            loudness: self.loudness,
+            peak: peak.either(identity, |idx| samples[idx.unwrap_or(0)].clone()),
+            samples,
+        }
+    }
+}
+
 impl RawSamples {
+    pub fn is_decibels(&self) -> bool {
+        matches!(self, Self::Decibels(_))
+    }
+
     pub fn as_decibels(&mut self) -> &mut Vec<f32> {
         take_or_recover(
             self,
@@ -129,44 +190,13 @@ impl RawSamples {
     }
 }
 
-impl PassBuilder {
-    fn compute_max(&mut self) -> usize {
-        let idx = self
-            .samples
-            .as_inner()
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| {
-                a.partial_cmp(b).unwrap_or_else(|| {
-                    if a.is_finite() {
-                        std::cmp::Ordering::Greater
-                    } else if b.is_finite() {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Equal
-                    }
-                })
-            })
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        self.idx_max = Some(idx);
-        idx
-    }
-
-    fn max(&mut self) -> usize {
-        self.idx_max.unwrap_or_else(|| self.compute_max())
-    }
-
-    pub fn build(mut self, frequencies: &[f32]) -> Pass {
-        Pass {
-            peak: self.max(),
-            samples: self
-                .samples
-                .into_decibels()
-                .into_iter()
-                .zip(frequencies)
-                .map(|(db, &freq)| Sample { freq, db })
-                .collect(),
+impl Default for Pass {
+    fn default() -> Self {
+        Self {
+            samples: vec![Sample { freq: 0.0, db: 0.0 }; 1],
+            peak: Sample { freq: 0.0, db: 0.0 },
+            loudness: (Sample { freq: 0.0, db: 0.0 }, Sample { freq: 0.0, db: 0.0 }),
+            instant: FFTBufferInstant::default(),
         }
     }
 }
