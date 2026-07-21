@@ -1,10 +1,8 @@
-use crate::{
-    audio::pipeline::module::{
-        Capture, CaptureSpec, PassBuilder, PassSpec, PipelineModule, Transformer,
-    },
-    audio::{
-        fft::executor::{FFTExecutor, HANN_WINDOW_GAIN, hann_window},
-        pipeline::Sample,
+use crate::audio::{
+    fft::executor::{FFTExecutor, HANN_WINDOW_GAIN, hann_window},
+    pipeline::{
+        module::{Capture, CaptureSpec, PipelineModule, Transformer},
+        pass::{PassBuilder, PassSpec, RawSamples},
     },
 };
 
@@ -48,27 +46,25 @@ impl Transformer for FFTransform {
 
         let samples = fft_samples[..self.samples_out]
             .into_iter()
-            .enumerate() // TODO: Store the frequencies, then zip them togeather
-            .map(|(bin, c)| {
+            .map(|c| {
                 let power = c.norm_sqr() * self.power_factor;
-                Sample {
-                    freq: bin as f32 * self.bin_width_hz,
-                    db: power.max(self.min_power).log10() * 10.0,
-                }
+                power.max(self.min_power).log10() * 10.0
             })
             .collect();
 
         PassBuilder {
-            samples,
+            samples: RawSamples::from_decibels(samples),
             idx_max: None,
         }
     }
 }
 
 impl PipelineModule<CaptureSpec, PassSpec> for FFTransform {
-    fn spec(&self, upstream: CaptureSpec) -> PassSpec {
+    fn spec(&self, _upstream: CaptureSpec) -> PassSpec {
         PassSpec {
-            samples: upstream.resolution.samples_out(),
+            frequencies: (0..self.samples_out)
+                .map(|bin| bin as f32 * self.bin_width_hz)
+                .collect(),
         }
     }
 }

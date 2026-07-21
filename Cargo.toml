@@ -27,6 +27,7 @@ rocket_dyn_templates = { version = "0.2.0", features = [
 ], optional = true }
 rodio = "0.22.2"
 rustfft = "6.4.1"
+take_mut = "0.2.2"
 tokio = { version = "1.52.3", features = ["full"] }
 windows = { version = "0.62.2", features = [
 	"Media_Control",

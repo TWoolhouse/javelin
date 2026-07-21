@@ -9,8 +9,10 @@ mod history;
 use crate::{
     audio::{
         fft::FFTResolution,
-        pipeline::Sample,
-        pipeline::{Pass, PipelineReconfigurable},
+        pipeline::{
+            PipelineReconfigurable,
+            pass::{Pass, Sample},
+        },
     },
     host::action::{Action, Actionable},
 };

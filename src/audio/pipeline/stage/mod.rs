@@ -1,4 +1,7 @@
-use crate::audio::pipeline::module::{PassSpec, PostStage as PostStageTrait, PostStageBuilder};
+use crate::audio::pipeline::{
+    module::{PostStage as PostStageTrait, PostStageBuilder},
+    pass::PassSpec,
+};
 
 pub mod notes;
 pub mod smooth;

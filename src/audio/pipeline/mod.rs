@@ -1,52 +1,25 @@
 use crate::audio::pipeline::{
     capture::{DeviceCapture, DeviceCaptureConfig},
     module::{Capturer, PipelineModule, PostStage, Transformer},
+    pass::Pass,
     stage::PostStage as PostStageConfig,
     transform::{FFTransform, FFTransformConfig},
 };
 
 pub mod capture;
 pub mod module;
+pub mod pass;
 mod reconfigurable;
 pub mod stage;
 pub mod transform;
 pub use reconfigurable::PipelineReconfigurable;
-use rodio::math::{db_to_linear, linear_to_db};
-
-#[derive(Debug, Clone)]
-pub struct Sample {
-    /// Frequency in Hz
-    pub freq: f32,
-    /// Decibels
-    pub db: f32,
-}
-
-impl Sample {
-    /// [db_to_linear]
-    pub fn amp(&self) -> f32 {
-        db_to_linear(self.db)
-    }
-
-    pub fn with_amp(&self, amp: f32) -> Self {
-        Self {
-            freq: self.freq,
-            db: linear_to_db(amp),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Pass {
-    pub samples: Vec<Sample>,
-    /// Index of the peak sample in the [samples](Self::samples) vector
-    pub peak: usize,
-}
 
 pub struct Pipeline {
     capturer: DeviceCapture,
     // pre_stages: Vec<Box<dyn PreStage>>, // TODO: Add pre-stages?
     transformer: FFTransform,
     post_stages: Vec<Box<dyn PostStage>>,
+    frequencies: Vec<f32>,
 }
 
 impl Pipeline {
@@ -73,6 +46,7 @@ impl Pipeline {
             // pre_stages: Vec::new(),
             transformer,
             post_stages: modules,
+            frequencies: spec.frequencies,
         }
     }
 
@@ -82,12 +56,6 @@ impl Pipeline {
         for stage in self.post_stages.iter_mut() {
             pass = stage.process(pass);
         }
-        pass.into()
-    }
-}
-
-impl Pass {
-    pub fn peak_sample(&self) -> &Sample {
-        &self.samples[self.peak]
+        pass.build(&self.frequencies)
     }
 }

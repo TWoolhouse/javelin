@@ -1,5 +1,6 @@
-use crate::audio::pipeline::module::{
-    PassBuilder, PassSpec, PipelineModule, PostStage, PostStageBuilder,
+use crate::audio::pipeline::{
+    module::{PipelineModule, PostStage, PostStageBuilder},
+    pass::{PassBuilder, PassSpec},
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -15,9 +16,14 @@ pub struct StageSmooth {
 
 impl PostStage for StageSmooth {
     fn process(&mut self, mut pass: PassBuilder) -> PassBuilder {
-        for (sample, smooth) in pass.samples.iter_mut().zip(self.buffer.iter_mut()) {
-            *smooth += (sample.amp() - *smooth) * (self.config.bias_new);
-            *sample = sample.with_amp(*smooth);
+        for (sample, smooth) in pass
+            .samples
+            .as_amplitudes()
+            .iter_mut()
+            .zip(self.buffer.iter_mut())
+        {
+            *smooth += (*sample - *smooth) * (self.config.bias_new);
+            *sample = *smooth;
         }
 
         pass
@@ -36,7 +42,7 @@ impl PostStageBuilder for Smooth {
         self.bias_new = self.bias_new.clamp(0.0, 1.0);
         Ok(Self::Stage {
             config: self.clone(),
-            buffer: vec![0.0; spec.samples],
+            buffer: vec![0.0; spec.sample_count()],
         })
     }
 }
