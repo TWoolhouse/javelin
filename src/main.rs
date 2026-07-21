@@ -7,9 +7,11 @@ mod audio;
 mod host;
 mod ui;
 // mod controller;
+#[cfg(feature = "server")]
+mod server;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut terminal = ratatui::init();
+    logging()?;
 
     let app = App::default();
 
@@ -22,13 +24,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::time::Duration::from_millis((1000.0 / refresh_rate) as u64),
     );
 
-    let result = {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?
-            .block_on(host.run(&mut terminal))
-    };
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let rocket_handle = {
+                #[cfg(feature = "server")]
+                {
+                    let rocket = server::build().await?;
+                    let shutdown = rocket.shutdown();
 
-    ratatui::restore();
-    result
+                    let rocket_handle = tokio::spawn(rocket.launch());
+                    async move || {
+                        shutdown.notify();
+                        rocket_handle.await.map_err(|e| {
+                            let b: Box<dyn std::error::Error> = Box::new(e);
+                            b
+                        })?;
+                        Ok(())
+                    }
+                }
+                #[cfg(not(feature = "server"))]
+                {
+                    async move || Ok(())
+                }
+            };
+
+            let mut terminal = ratatui::init();
+            let host_res = host.run(&mut terminal).await;
+            ratatui::restore();
+
+            match (host_res, rocket_handle().await) {
+                (Ok(_), Ok(_)) => Ok(()),
+                (Err(e), _) => Err(e),
+                (_, Err(e)) => Err(e),
+            }
+        })
+}
+
+fn logging() -> Result<(), fern::InitError> {
+    fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "[{}][{}] {}",
+                record.level(),
+                record.target(),
+                message
+            ))
+        })
+        .level(log::LevelFilter::Debug)
+        .chain(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open("javelin.log")?,
+        )
+        .apply()?;
+    Ok(())
 }

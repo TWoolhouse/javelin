@@ -1,21 +1,17 @@
-use crate::audio::{
-    fft::{FFTBuffer, processor::FFTProcessor},
-    pipeline::config::ConfigBuilder,
-    stream::Stream,
+use crate::audio::pipeline::{
+    capture::{DeviceCapture, DeviceCaptureConfig},
+    module::{Capturer, PipelineModule, PostStage, Transformer},
+    stage::PostStage as PostStageConfig,
+    transform::{FFTransform, FFTransformConfig},
 };
 
-pub mod config;
-use config::Config;
-mod pass;
-pub use pass::FFTPass;
-use rodio::math::db_to_linear;
-
-#[derive(Debug)]
-pub struct Pipeline {
-    config: Config,
-    processor: FFTProcessor,
-    stream: Stream,
-}
+pub mod capture;
+pub mod module;
+mod reconfigurable;
+pub mod stage;
+pub mod transform;
+pub use reconfigurable::PipelineReconfigurable;
+use rodio::math::{db_to_linear, linear_to_db};
 
 #[derive(Debug, Clone)]
 pub struct Sample {
@@ -23,8 +19,6 @@ pub struct Sample {
     pub freq: f32,
     /// Decibels
     pub db: f32,
-    /// Linear amplitude, see [db_to_linear]
-    pub amp: f32,
 }
 
 impl Sample {
@@ -32,54 +26,68 @@ impl Sample {
     pub fn amp(&self) -> f32 {
         db_to_linear(self.db)
     }
+
+    pub fn with_amp(&self, amp: f32) -> Self {
+        Self {
+            freq: self.freq,
+            db: linear_to_db(amp),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Pass {
+    pub samples: Vec<Sample>,
+    /// Index of the peak sample in the [samples](Self::samples) vector
+    pub peak: usize,
+}
+
+pub struct Pipeline {
+    capturer: DeviceCapture,
+    // pre_stages: Vec<Box<dyn PreStage>>, // TODO: Add pre-stages?
+    transformer: FFTransform,
+    post_stages: Vec<Box<dyn PostStage>>,
 }
 
 impl Pipeline {
-    pub fn new(config: impl Into<ConfigBuilder>) -> Self {
-        let config = config.into().build();
+    pub fn new<'s>(
+        capture: &mut DeviceCaptureConfig,
+        transform: &mut FFTransformConfig,
+        stages: impl IntoIterator<Item = &'s mut PostStageConfig>,
+    ) -> Self {
+        let capturer = DeviceCapture::new(capture);
+        let spec = capturer.spec(());
+        let transformer = FFTransform::new(transform, &spec);
+        let mut spec = transformer.spec(spec);
 
-        let (fft_tx, fft_rx) = FFTBuffer::new(config.resolution.samples());
+        let stages = stages.into_iter();
+        let mut modules = Vec::with_capacity(stages.size_hint().0);
+        for stage_config in stages {
+            let stage = stage_config.build(&spec).unwrap(); // TODO: Handle errors
+            spec = stage.spec(spec);
+            modules.push(stage);
+        }
 
-        // FIXME: propergate errors
         Self {
-            processor: FFTProcessor::new(config.resolution.samples()),
-            stream: config
-                .device
-                .create_stream_as_input_from_output_device(fft_tx, fft_rx)
-                .unwrap(),
-            config,
+            capturer,
+            // pre_stages: Vec::new(),
+            transformer,
+            post_stages: modules,
         }
     }
 
-    pub fn reconfigure(&mut self, config: impl Into<ConfigBuilder>) {
-        let config = config.into().build();
-
-        macro_rules! delta {
-            ($old:expr, $new:expr, $($attr:tt)+) => {
-                $old.$($attr)+ != $new.$($attr)+
-            };
+    pub fn run(&mut self) -> Pass {
+        let capture = self.capturer.capture();
+        let mut pass = self.transformer.process(capture);
+        for stage in self.post_stages.iter_mut() {
+            pass = stage.process(pass);
         }
-
-        if delta!(self.config, config, resolution.samples()) {
-            self.processor.resize(config.resolution.samples());
-        }
-        if delta!(self.config, config, resolution.samples()) || delta!(self.config, config, device)
-        {
-            let (fft_tx, fft_rx) = FFTBuffer::new(config.resolution.samples());
-            self.stream = config
-                .device
-                .create_stream_as_input_from_output_device(fft_tx, fft_rx)
-                .unwrap();
-        }
-
-        self.config = config;
-    }
-
-    pub fn config(&self) -> &Config {
-        &self.config
+        pass.into()
     }
 }
 
-// Other impl's
-mod fft;
-// mod history;
+impl Pass {
+    pub fn peak_sample(&self) -> &Sample {
+        &self.samples[self.peak]
+    }
+}

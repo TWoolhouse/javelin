@@ -78,14 +78,14 @@ impl FFTBufferTX {
 }
 
 impl FFTBufferRX {
-    pub fn slice(&mut self) -> &[f32] {
+    pub fn slice(&mut self) -> &mut [f32] {
         {
             let ring = self.ring.lock().unwrap();
             let (first, second) = ring.buffer.split_at(ring.cursor);
             self.buffer[..first.len()].copy_from_slice(first);
             self.buffer[first.len()..].copy_from_slice(second);
         }
-        &self.buffer
+        &mut self.buffer
     }
 
     pub fn len(&self) -> usize {

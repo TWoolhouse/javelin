@@ -9,15 +9,25 @@ use ratatui::{
     },
 };
 use rodio::math::{db_to_linear, linear_to_db};
+use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{app::App, audio::fft::FFTResolution, host::action::Actionable};
+use crate::{
+    app::App,
+    host::action::{Action, Actionable},
+};
+
+// mod waveform;
+
+#[derive(Debug, Default, Clone)]
+pub struct State {}
 
 impl Widget for &mut App {
     fn render(self, area: Rect, buf: &mut Buffer)
     where
         Self: Sized,
     {
-        let fft_pass = self.fft();
+        // self.resolution()
+        let fft_pass = &self.pass;
         let bars = fft_pass
             .samples
             .array_windows::<2>()
@@ -26,9 +36,9 @@ impl Widget for &mut App {
                 let next_freq_lin = crate::app::db::linearise_frequency(next.freq);
                 Rectangle {
                     x: freq_lin as f64,
-                    y: -sample.amp as f64,
+                    y: -sample.amp() as f64,
                     width: (next_freq_lin - freq_lin) as f64,
-                    height: (sample.amp * 2.0) as f64,
+                    height: (sample.amp() * 2.0) as f64,
                     ..Default::default()
                 }
             })
@@ -36,13 +46,15 @@ impl Widget for &mut App {
 
         let max_now = (
             Instant::now(),
-            fft_pass.peak_sample().amp as f32,
-            fft_pass.samples.into_iter().map(|s| s.amp).collect(),
+            fft_pass.peak_sample().amp() as f32,
+            fft_pass.samples.iter().map(|s| s.amp()).collect(),
         );
+
+        let max_time = std::time::Duration::from_secs_f32(0.1);
 
         let pp = self
             .history_db
-            .partition_point(|(t, ..)| (max_now.0 - *t) > std::time::Duration::from_secs_f32(1.0));
+            .partition_point(|(t, ..)| (max_now.0 - *t) > max_time);
         self.history_db.drain(..pp);
         self.history_db.push_back(max_now);
 
@@ -59,13 +71,14 @@ impl Widget for &mut App {
         let render_min = db_to_linear(-160.0) as f64;
 
         // HACK: 75% to allow bass to go off screen, to show the rest of the spectrum better, as bass is much louder than the rest of the spectrum.
-        let render_bounds = (max_height * 0.65).max(render_min);
+        let render_bounds = (max_height * 1.0).max(render_min);
 
         Canvas::default()
             .block(Block::bordered().title("Canvas").title_bottom(vec![
                 Span::from(format!("{:.2} Hz ", self.resolution().hertz())),
                 Span::from(format!("{} ms ", self.resolution().duration().as_millis())),
-                Span::from(format!("{} samples ", bars.len())),
+                Span::from(format!("{} samples ", self.resolution().samples_out(),)),
+                Span::from(format!("{} bars ", bars.len())),
                 Span::from(format!("{} Hz ", self.resolution().sample_rate())),
                 Span::from(format!("{:.2} dB FS ", linear_to_db(max_height as f32))),
                 Span::from(format!(
@@ -74,7 +87,7 @@ impl Widget for &mut App {
                 )),
             ]))
             .x_bounds([0.0, 1.0])
-            .y_bounds([-render_bounds, render_bounds])
+            .y_bounds([0.0, render_bounds])
             .paint(|ctx| {
                 bars.iter().for_each(|bar| {
                     ctx.draw(bar);
@@ -86,25 +99,17 @@ impl Widget for &mut App {
     }
 }
 
-impl Actionable<Event> for App {
-    fn action(&mut self, action: Event) -> Option<Event> {
+impl Actionable<Event, &UnboundedSender<Action>> for App {
+    fn action(&mut self, action: Event, tx: &UnboundedSender<Action>) -> Option<Event> {
         action
             .as_key_press_event()
             .and_then(|ref key| match key.code {
                 KeyCode::Up => {
-                    self.resize(FFTResolution::from_samples(
-                        self.resolution().samples() + 1,
-                        self.resolution().sample_rate(),
-                    ));
+                    let _ = tx.send(Action::FFTSizeUp);
                     None
                 }
                 KeyCode::Down => {
-                    // TODO: Make this go down a step, instead of half, search for the next optimal below.
-                    // FIXME: Prevent 0 samples
-                    self.resize(FFTResolution::from_samples(
-                        self.resolution().samples() / 2,
-                        self.resolution().sample_rate(),
-                    ));
+                    let _ = tx.send(Action::FFTSizeDown);
                     None
                 }
                 _ => Some(action),

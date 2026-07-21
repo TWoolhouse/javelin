@@ -10,11 +10,11 @@ use tokio::{
 
 use crate::{
     app::App,
-    host::action::{Action, Actionable, Packet},
+    host::action::{Action, Actionable},
 };
 pub mod action;
 
-#[derive(Debug)]
+// #[derive(Debug)]
 pub struct Host {
     app: App,
     exit: bool,
@@ -52,7 +52,9 @@ impl Host {
 
         while !self.exit {
             // Render the UI
+            self.action(Action::Render);
             terminal.draw(|frame| frame.render_widget(&mut self.app, frame.area()))?;
+
             // Wait for the next event or action
             select! {
                 // Tick the UI at the refresh rate
@@ -87,13 +89,9 @@ impl Host {
     }
 
     fn action(&mut self, action: Action) {
-        let packet = Packet {
-            action,
-            tx: self.tx.clone(),
-        };
         self.app
-            .action(packet)
-            .map(|Packet { action, .. }| match action {
+            .action(action, &self.tx)
+            .map(|action| match action {
                 Action::Quit => self.exit = true,
                 _ => {}
             });
@@ -101,7 +99,7 @@ impl Host {
 
     fn terminal_event(&mut self, event: Event) {
         self.app
-            .action(event)
+            .action(event, &self.tx)
             .map(|event| match event.as_key_press_event() {
                 Some(key) => match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => {

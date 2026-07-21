@@ -1,23 +1,23 @@
-use std::{fmt::Debug, sync::Arc};
+use std::{any::type_name_of_val, fmt::Debug, sync::Arc};
 
 use rustfft::{Fft, FftPlanner, num_complex::Complex32};
 
-pub struct FFTProcessor {
+pub struct FFTExecutor {
     planner: FftPlanner<f32>,
     fft: Arc<dyn Fft<f32>>,
     buffer: Vec<Complex32>,
     scratch: Vec<Complex32>,
 }
 
-impl Debug for FFTProcessor {
+impl Debug for FFTExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FFTProcessor")
+        f.debug_struct(type_name_of_val(self))
             .field("fft", &self.fft.len())
             .finish()
     }
 }
 
-impl FFTProcessor {
+impl FFTExecutor {
     pub fn new(size: usize) -> Self {
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft_forward(size);
@@ -36,7 +36,10 @@ impl FFTProcessor {
             .resize(self.fft.get_inplace_scratch_len(), Default::default());
     }
 
-    pub fn process<'a>(&'a mut self, input: impl IntoIterator<Item = f32>) -> &'a [Complex32] {
+    pub fn process_samples<'a>(
+        &'a mut self,
+        input: impl IntoIterator<Item = f32>,
+    ) -> &'a [Complex32] {
         for (buffer_elem, input_elem) in self.buffer.iter_mut().zip(
             input
                 .into_iter()

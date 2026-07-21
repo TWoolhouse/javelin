@@ -14,6 +14,11 @@ impl FFTResolution {
         self.size
     }
 
+    /// Number of samples in the output of the FFT
+    pub const fn samples_out(&self) -> usize {
+        self.size / 2
+    }
+
     /// Sample rate in Hertz.
     pub const fn sample_rate(&self) -> usize {
         self.sample_rate
